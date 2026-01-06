@@ -1,245 +1,185 @@
 
 import { createClient } from '@supabase/supabase-js';
-import { User, StudentData, UserRole, ClassSettings, QuizResult, ChatMessage, ChatSession, AssignmentMaster, VotingSession, Vote, Assignment } from '../types';
-import { INITIAL_STUDENTS, INITIAL_TEACHER, INITIAL_SETTINGS, MOCK_CHATS } from '../constants';
+import { User, StudentData, UserRole, QuizResult, ChatMessage, ChatSession, AssignmentMaster, VotingSession, Vote, Assignment } from '../types';
 
-// 注意：這些變數應在 Vercel 或部署平台的環境變數中設定
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
-// 如果沒有設定 Supabase，我們回退到 LocalStorage 模式以確保本地端仍可運作
-const isCloudEnabled = !!SUPABASE_URL && !!SUPABASE_ANON_KEY;
-const supabase = isCloudEnabled ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
-
-const USERS_STORAGE_KEY = 'class_sync_users';
-const CURRENT_USER_KEY = 'class_sync_current_user';
-const SETTINGS_STORAGE_KEY = 'class_sync_settings';
-const CHAT_MSG_STORAGE_KEY = 'class_sync_chat_msgs';
-const CHAT_SESSIONS_KEY = 'class_sync_chat_sessions';
-const ASSIGNMENT_MASTERS_KEY = 'class_sync_assignment_masters';
-const VOTING_SESSION_KEY = 'class_sync_voting_session';
-const VOTES_KEY = 'class_sync_votes';
-
-// --- Helpers ---
-const getLocal = (key: string, fallback: any) => {
-  const s = localStorage.getItem(key);
-  return s ? JSON.parse(s) : fallback;
-};
-
-const setLocal = (key: string, val: any) => {
-  localStorage.setItem(key, JSON.stringify(val));
-};
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 export const authService = {
-  isCloud: isCloudEnabled,
+  isCloud: !!SUPABASE_URL && !!SUPABASE_ANON_KEY,
 
-  init: async () => {
-    if (!localStorage.getItem(USERS_STORAGE_KEY)) {
-      setLocal(USERS_STORAGE_KEY, [INITIAL_TEACHER, ...INITIAL_STUDENTS]);
-    }
-    if (!localStorage.getItem(SETTINGS_STORAGE_KEY)) setLocal(SETTINGS_STORAGE_KEY, INITIAL_SETTINGS);
-    if (!localStorage.getItem(CHAT_MSG_STORAGE_KEY)) setLocal(CHAT_MSG_STORAGE_KEY, MOCK_CHATS);
-    if (!localStorage.getItem(CHAT_SESSIONS_KEY)) setLocal(CHAT_SESSIONS_KEY, []);
-    if (!localStorage.getItem(ASSIGNMENT_MASTERS_KEY)) setLocal(ASSIGNMENT_MASTERS_KEY, []);
-    if (!localStorage.getItem(VOTING_SESSION_KEY)) setLocal(VOTING_SESSION_KEY, { isActive: false, sessionId: 'init', lastStartedAt: '' });
-    if (!localStorage.getItem(VOTES_KEY)) setLocal(VOTES_KEY, []);
-  },
+  init: async () => {},
 
   login: async (username: string, password: string): Promise<User | StudentData | null> => {
-    // 雖然 Supabase 有自己的 Auth，但為了保持原有邏輯，我們使用資料表模擬
-    const users = getLocal(USERS_STORAGE_KEY, []);
-    const user = users.find((u: any) => u.username === username && u.password === password);
-    if (user) {
-      setLocal(CURRENT_USER_KEY, user);
-      return user;
-    }
-    return null;
+    const { data, error } = await supabase.from('users').select('*').eq('username', username).eq('password', password).single();
+    if (error || !data) return null;
+    const user = {
+      ...data,
+      quizResult: data.quiz_result,
+      transactions: data.transactions || [],
+      assignments: data.assignments || [],
+      chatNicknames: data.chat_nicknames || {}
+    };
+    localStorage.setItem('class_sync_current_user', JSON.stringify(user));
+    return user;
   },
 
   register: async (name: string, username: string, password: string, role: UserRole): Promise<User | StudentData> => {
-    const users = getLocal(USERS_STORAGE_KEY, []);
-    if (users.some((u: any) => u.username === username)) throw new Error('帳號已存在');
-
-    const baseUser = { id: Date.now().toString(), name, username, password, role };
-    let newUser: User | StudentData;
-    if (role === UserRole.STUDENT) {
-      newUser = { ...baseUser, balance: 0, transactions: [], assignments: [], chatNicknames: {} } as StudentData;
-    } else {
-      newUser = baseUser;
-    }
-
-    const updatedUsers = [...users, newUser];
-    setLocal(USERS_STORAGE_KEY, updatedUsers);
-    setLocal(CURRENT_USER_KEY, newUser);
-    return newUser;
+    const id = Date.now().toString();
+    const newUser = { id, name, username, password, role, balance: 0, transactions: [], assignments: [], chat_nicknames: {} };
+    const { error } = await supabase.from('users').insert([newUser]);
+    if (error) throw new Error('註冊失敗：' + error.message);
+    const userToStore = { ...newUser, chatNicknames: {} };
+    localStorage.setItem('class_sync_current_user', JSON.stringify(userToStore));
+    return userToStore as any;
   },
 
-  logout: () => {
-    localStorage.removeItem(CURRENT_USER_KEY);
+  logout: () => localStorage.removeItem('class_sync_current_user'),
+
+  getCurrentUser: (): User | null => {
+    const s = localStorage.getItem('class_sync_current_user');
+    return s ? JSON.parse(s) : null;
   },
 
-  getCurrentUser: (): User | null => getLocal(CURRENT_USER_KEY, null),
-
-  getStudents: (): StudentData[] => {
-    const users = getLocal(USERS_STORAGE_KEY, []);
-    return users.filter((u: any) => u.role === UserRole.STUDENT) as StudentData[];
+  getStudents: async (): Promise<StudentData[]> => {
+    const { data } = await supabase.from('users').select('*').eq('role', UserRole.STUDENT);
+    return (data || []).map(d => ({ ...d, quizResult: d.quiz_result, chatNicknames: d.chat_nicknames || {} }));
   },
 
   updateStudent: async (studentData: StudentData) => {
-    const users = getLocal(USERS_STORAGE_KEY, []);
-    const index = users.findIndex((u: any) => u.id === studentData.id);
-    if (index !== -1) {
-      users[index] = studentData;
-      setLocal(USERS_STORAGE_KEY, users);
-      const currentUser = authService.getCurrentUser();
-      if (currentUser && currentUser.id === studentData.id) {
-        setLocal(CURRENT_USER_KEY, studentData);
-      }
-    }
+    await supabase.from('users').update({ balance: studentData.balance, transactions: studentData.transactions, quiz_result: studentData.quizResult, assignments: studentData.assignments, chat_nicknames: studentData.chatNicknames }).eq('id', studentData.id);
   },
 
-  saveStudentNickname: (studentId: string, sessionId: string, nickname: string) => {
-    const users = getLocal(USERS_STORAGE_KEY, []);
-    const student = users.find((u: any) => u.id === studentId) as StudentData;
-    if (student && student.role === UserRole.STUDENT) {
-      if (!student.chatNicknames) student.chatNicknames = {};
-      student.chatNicknames[sessionId] = nickname;
-      authService.updateStudent(student);
-    }
+  getChatSessions: async (): Promise<ChatSession[]> => {
+    const { data } = await supabase.from('chat_sessions').select('*').order('created_at', { ascending: false });
+    return (data || []).map(d => ({ id: d.id, topic: d.topic, isActive: d.is_active, createdAt: d.created_at }));
   },
 
-  submitQuizResult: (studentId: string, result: QuizResult) => {
-    const users = getLocal(USERS_STORAGE_KEY, []);
-    const student = users.find((u: any) => u.id === studentId) as StudentData;
-    if (student && student.role === UserRole.STUDENT) {
-      student.quizResult = result;
-      authService.updateStudent(student);
-    }
+  createChatSession: async (topic: string): Promise<ChatSession> => {
+    const newSession = { id: Date.now().toString(), topic, is_active: true };
+    await supabase.from('chat_sessions').insert([newSession]);
+    return { id: newSession.id, topic: newSession.topic, isActive: true, createdAt: new Date().toISOString() };
   },
 
-  getChatSessions: (): ChatSession[] => getLocal(CHAT_SESSIONS_KEY, []),
-
-  createChatSession: (topic: string): ChatSession => {
-    const sessions = authService.getChatSessions();
-    const newSession: ChatSession = {
-      id: Date.now().toString(),
-      topic,
-      isActive: true,
-      createdAt: new Date().toISOString()
-    };
-    setLocal(CHAT_SESSIONS_KEY, [newSession, ...sessions]);
-    return newSession;
+  // Added updateChatSession to fix App.tsx error
+  updateChatSession: async (sessionId: string, updates: Partial<ChatSession>) => {
+    const supabaseUpdates: any = {};
+    if (updates.topic !== undefined) supabaseUpdates.topic = updates.topic;
+    if (updates.isActive !== undefined) supabaseUpdates.is_active = updates.isActive;
+    await supabase.from('chat_sessions').update(supabaseUpdates).eq('id', sessionId);
   },
 
-  updateChatSession: (sessionId: string, updates: Partial<ChatSession>) => {
-    const sessions = authService.getChatSessions();
-    const updated = sessions.map(s => s.id === sessionId ? { ...s, ...updates } : s);
-    setLocal(CHAT_SESSIONS_KEY, updated);
+  getChatMessages: async (sessionId?: string): Promise<ChatMessage[]> => {
+    let query = supabase.from('chat_messages').select('*');
+    if (sessionId) query = query.eq('session_id', sessionId);
+    const { data } = await query.order('timestamp', { ascending: true });
+    return (data || []).map(m => ({ id: m.id, sessionId: m.session_id, userId: m.user_id, userName: m.user_name, content: m.content, timestamp: m.timestamp, isAnonymous: m.is_anonymous }));
   },
 
-  getChatMessages: (): ChatMessage[] => getLocal(CHAT_MSG_STORAGE_KEY, []),
-
-  addChatMessage: (message: ChatMessage) => {
-    const messages = getLocal(CHAT_MSG_STORAGE_KEY, []);
-    setLocal(CHAT_MSG_STORAGE_KEY, [...messages, message]);
+  addChatMessage: async (m: ChatMessage) => {
+    await supabase.from('chat_messages').insert([{ id: m.id, session_id: m.sessionId, user_id: m.userId, user_name: m.userName, content: m.content, timestamp: m.timestamp, is_anonymous: m.isAnonymous }]);
   },
 
-  getAssignmentMasters: (): AssignmentMaster[] => getLocal(ASSIGNMENT_MASTERS_KEY, []),
-
-  createAssignmentMaster: (title: string, deadline: string): AssignmentMaster => {
-    const masters = authService.getAssignmentMasters();
-    const newMaster: AssignmentMaster = {
-      id: Date.now().toString(),
-      title,
-      deadline,
-      isActive: true,
-      createdAt: new Date().toISOString()
-    };
-    setLocal(ASSIGNMENT_MASTERS_KEY, [newMaster, ...masters]);
-    return newMaster;
+  saveStudentNickname: async (userId: string, sessionId: string, nickname: string) => {
+    const { data } = await supabase.from('users').select('chat_nicknames').eq('id', userId).single();
+    const nicknames = data?.chat_nicknames || {};
+    nicknames[sessionId] = nickname;
+    await supabase.from('users').update({ chat_nicknames: nicknames }).eq('id', userId);
   },
 
-  // Submit an assignment for the current student
+  submitQuizResult: async (studentId: string, result: QuizResult) => {
+    await supabase.from('users').update({ quiz_result: result }).eq('id', studentId);
+  },
+
+  getAssignmentMasters: async (): Promise<AssignmentMaster[]> => {
+    const { data } = await supabase.from('assignment_masters').select('*').order('created_at', { ascending: false });
+    return (data || []).map(m => ({ id: m.id, title: m.title, deadline: m.deadline, createdAt: m.created_at, isActive: m.is_active }));
+  },
+
+  createAssignmentMaster: async (title: string, deadline: string) => {
+    await supabase.from('assignment_masters').insert([{ id: Date.now().toString(), title, deadline, is_active: true }]);
+  },
+
   onStudentSubmit: async (masterId: string, content: string) => {
-    const currentUser = authService.getCurrentUser() as StudentData;
-    if (!currentUser || currentUser.role !== UserRole.STUDENT) return;
+    const user = authService.getCurrentUser() as StudentData;
+    if (!user) return;
+    const { data } = await supabase.from('users').select('assignments').eq('id', user.id).single();
+    const current = data?.assignments || [];
+    const newItem: Assignment = { id: Date.now().toString(), masterId, title: '作業繳交', content, status: 'submitted', submittedAt: new Date().toISOString() };
+    await supabase.from('users').update({ assignments: [...current, newItem] }).eq('id', user.id);
+  },
 
-    const masters = authService.getAssignmentMasters();
-    const master = masters.find(m => m.id === masterId);
-    if (!master) return;
+  onGrade: async (studentId: string, aid: string, score: number) => {
+    const { data } = await supabase.from('users').select('assignments').eq('id', studentId).single();
+    const list = (data?.assignments || []).map((a: any) => a.id === aid ? { ...a, score, status: 'graded' } : a);
+    await supabase.from('users').update({ assignments: list }).eq('id', studentId);
+  },
 
-    const newAssignment: Assignment = {
-      id: Date.now().toString(),
-      masterId: master.id,
-      title: master.title,
-      content,
-      status: 'submitted',
-      submittedAt: new Date().toISOString()
+  onTeacherReply: async (studentId: string, aid: string, reply: string) => {
+    const { data } = await supabase.from('users').select('assignments').eq('id', studentId).single();
+    const list = (data?.assignments || []).map((a: any) => a.id === aid ? { ...a, teacherReply: reply } : a);
+    await supabase.from('users').update({ assignments: list }).eq('id', studentId);
+  },
+
+  // Added voting methods to fix VotingView.tsx errors
+  getVotingSession: async (): Promise<VotingSession> => {
+    const { data } = await supabase.from('voting_session').select('*').single();
+    if (!data) return { isActive: false, sessionId: '1', lastStartedAt: new Date().toISOString() };
+    return {
+      isActive: data.is_active,
+      sessionId: data.session_id,
+      lastStartedAt: data.last_started_at
     };
-
-    const updatedUser = {
-      ...currentUser,
-      assignments: [...(currentUser.assignments || []), newAssignment]
-    };
-
-    await authService.updateStudent(updatedUser);
   },
 
-  // Grade a student's assignment
-  onGrade: async (studentId: string, assignmentId: string, score: number) => {
-    const students = authService.getStudents();
-    const student = students.find(s => s.id === studentId);
-    if (!student) return;
-
-    const updatedAssignments = student.assignments.map(a => 
-      a.id === assignmentId ? { ...a, score, status: 'graded' as const } : a
-    );
-
-    await authService.updateStudent({
-      ...student,
-      assignments: updatedAssignments
-    });
+  getVotes: async (): Promise<Vote[]> => {
+    const { data } = await supabase.from('votes').select('*');
+    return (data || []).map(v => ({
+      voterId: v.voter_id,
+      targetId: v.target_id,
+      sessionId: v.session_id,
+      timestamp: v.timestamp
+    }));
   },
 
-  // Add a teacher's reply to a student's assignment
-  onTeacherReply: async (studentId: string, assignmentId: string, reply: string) => {
-    const students = authService.getStudents();
-    const student = students.find(s => s.id === studentId);
-    if (!student) return;
-
-    const updatedAssignments = student.assignments.map(a => 
-      a.id === assignmentId ? { ...a, teacherReply: reply } : a
-    );
-
-    await authService.updateStudent({
-      ...student,
-      assignments: updatedAssignments
-    });
+  updateVotingSession: async (isActive: boolean) => {
+    const { data: current } = await supabase.from('voting_session').select('*').single();
+    const newSessionId = isActive && !current?.is_active ? Date.now().toString() : (current?.session_id || '1');
+    
+    if (current) {
+      await supabase.from('voting_session').update({ 
+        is_active: isActive, 
+        session_id: newSessionId, 
+        last_started_at: isActive ? new Date().toISOString() : current.last_started_at 
+      }).eq('id', current.id);
+    } else {
+      await supabase.from('voting_session').insert([{ 
+        is_active: isActive, 
+        session_id: newSessionId, 
+        last_started_at: new Date().toISOString() 
+      }]);
+    }
   },
 
-  getVotingSession: (): VotingSession => getLocal(VOTING_SESSION_KEY, { isActive: false, sessionId: 'init', lastStartedAt: '' }),
+  castVote: async (voterId: string, targetId: string) => {
+    const { data: sessionData } = await supabase.from('voting_session').select('*').single();
+    if (!sessionData || !sessionData.is_active) throw new Error("目前非投票時間");
+    
+    const { data: allSessionVotes } = await supabase.from('votes')
+      .select('*')
+      .eq('voter_id', voterId)
+      .eq('session_id', sessionData.session_id);
+      
+    if (allSessionVotes && allSessionVotes.length >= 3) throw new Error("本輪 3 票已全數投出");
+    if (allSessionVotes && allSessionVotes.some(v => v.target_id === targetId)) throw new Error("此輪已投過該同學");
 
-  updateVotingSession: (isActive: boolean) => {
-    const current = authService.getVotingSession();
-    const session: VotingSession = {
-      isActive,
-      sessionId: isActive && !current.isActive ? Date.now().toString() : current.sessionId,
-      lastStartedAt: isActive && !current.isActive ? new Date().toISOString() : current.lastStartedAt
-    };
-    setLocal(VOTING_SESSION_KEY, session);
-  },
-
-  getVotes: (): Vote[] => getLocal(VOTES_KEY, []),
-
-  castVote: (voterId: string, targetId: string) => {
-    const session = authService.getVotingSession();
-    if (!session.isActive) throw new Error('投票目前已關閉');
-    const votes = authService.getVotes();
-    const myVotes = votes.filter(v => v.voterId === voterId && v.sessionId === session.sessionId);
-    if (myVotes.length >= 3) throw new Error('您在本輪投票中已經投完 3 票了');
-    if (myVotes.some(v => v.targetId === targetId)) throw new Error('您已經投過這位同學了');
-
-    const newVote: Vote = { voterId, targetId, sessionId: session.sessionId, timestamp: new Date().toISOString() };
-    setLocal(VOTES_KEY, [...votes, newVote]);
+    await supabase.from('votes').insert([{
+      voter_id: voterId,
+      target_id: targetId,
+      session_id: sessionData.session_id,
+      timestamp: new Date().toISOString()
+    }]);
   }
 };

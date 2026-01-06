@@ -11,8 +11,9 @@ interface VotingViewProps {
 }
 
 const VotingView: React.FC<VotingViewProps> = ({ currentUser, students }) => {
-  const [session, setSession] = useState<VotingSession>(authService.getVotingSession());
-  const [votes, setVotes] = useState<Vote[]>(authService.getVotes());
+  // Fix: Initialize with default values as authService methods are now async
+  const [session, setSession] = useState<VotingSession>({ isActive: false, sessionId: '1', lastStartedAt: '' });
+  const [votes, setVotes] = useState<Vote[]>([]);
   const [viewMode, setViewMode] = useState<'current' | 'cumulative'>('current');
 
   // Logic for calculations
@@ -23,31 +24,36 @@ const VotingView: React.FC<VotingViewProps> = ({ currentUser, students }) => {
   const totalVotesForMe = votes.filter(v => v.targetId === currentUser.id).length;
 
   useEffect(() => {
-    const fetchData = () => {
-        setVotes(authService.getVotes());
-        setSession(authService.getVotingSession());
+    // Fix: Update fetchData to be async and handle Promises
+    const fetchData = async () => {
+        const [v, s] = await Promise.all([authService.getVotes(), authService.getVotingSession()]);
+        setVotes(v);
+        setSession(s);
     };
     fetchData();
-    const interval = setInterval(fetchData, 2000);
+    const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
   }, [currentUser.id]);
 
-  const toggleVoting = () => {
+  // Fix: Update toggleVoting to be async
+  const toggleVoting = async () => {
     const newStatus = !session.isActive;
-    authService.updateVotingSession(newStatus);
-    const updatedSession = authService.getVotingSession();
+    await authService.updateVotingSession(newStatus);
+    const updatedSession = await authService.getVotingSession();
     setSession(updatedSession);
     if (newStatus) setViewMode('current');
   };
 
-  const handleVote = (targetId: string) => {
+  // Fix: Update handleVote to be async
+  const handleVote = async (targetId: string) => {
     if (targetId === currentUser.id) {
         alert("不能投給自己喔！");
         return;
     }
     try {
-        authService.castVote(currentUser.id, targetId);
-        setVotes(authService.getVotes());
+        await authService.castVote(currentUser.id, targetId);
+        const updatedVotes = await authService.getVotes();
+        setVotes(updatedVotes);
     } catch (e: any) {
         alert(e.message);
     }
